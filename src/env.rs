@@ -37,8 +37,9 @@ fn parse(data: &[u8]) -> Option<(u8, BTreeMap<String, String>)> {
     }
     let mut map = BTreeMap::new();
     for entry in body.split(|&b| b == 0) {
+        // U-Boot 环境变量以双 NUL 结束
         if entry.is_empty() {
-            continue;
+            break;
         }
         let text = std::str::from_utf8(entry).ok()?;
         let (key, value) = text.split_once('=')?;
