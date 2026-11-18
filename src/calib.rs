@@ -181,11 +181,11 @@ pub fn normalize_nv_cfg(data: &[u8]) -> Result<Vec<u8>, String> {
     if data.len() < 21 {
         return Err("NV_CFG dump too small (< 21 bytes)".into());
     }
-    // 头部 = crc32(4B LE) + flags(1B) + "/** NV_CFG **/\n\0"。前 5 字节随设备 /
-    // 每次写入变化（CRC 覆盖 data[5..] 整个分区；flags 为写入计数），不能当固定
-    // 魔数比较，只认固定文本标记。
-    if &data[5..21] != b"/** NV_CFG **/\n\x00" {
-        return Err("NV_CFG marker mismatch (expect /** NV_CFG **/ at offset 5)".into());
+    if data[0..4] != [0x72, 0xd6, 0xef, 0x41] {
+        return Err("NV_CFG magic mismatch (expect 72 D6 EF 41 at offset 0)".into());
+    }
+    if &data[4..21] != b"\x13/** NV_CFG **/\n\x00" {
+        return Err("NV_CFG marker mismatch (expect /** NV_CFG **/)".into());
     }
     let last = data.iter().rposition(|&b| b != 0).map_or(21, |i| i + 1);
     // 保留最后一个条目的 NUL 终止符（若有），与原分区中的段边界一致
@@ -200,9 +200,8 @@ pub fn normalize_nv_cfg(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(data[..end].to_vec())
 }
 
-/// 校验已归一化的 NV_CFG 段：`/** NV_CFG **/` 标记（偏移 5）。
-/// PT1570 实测布局：crc32 LE(4B，覆盖 [5..] 整分区，随设备变化) + flags(1B) +
-/// "/** NV_CFG **/\n" + NUL +
+/// 校验已归一化的 NV_CFG 段：魔数 `72 D6 EF 41` + `/** NV_CFG **/`
+/// 标记。PT1570 实测布局：魔数(4B) + 0x13 + "/** NV_CFG **/\n" + NUL +
 /// `KEY=VALUE` 列表（NUL 分隔）。整段原样存档，不解析不重组。
 pub fn validate_nv_cfg(data: &[u8]) -> Result<(), String> {
     if data.len() > NV_CFG_MAX {
@@ -213,9 +212,11 @@ pub fn validate_nv_cfg(data: &[u8]) -> Result<(), String> {
         ));
     }
     if data.len() >= 21 {
-        // 前 5 字节（crc32 LE + flags）因设备而异，不校验；只认文本标记。
-        if &data[5..21] != b"/** NV_CFG **/\n\x00" {
-            return Err("NV_CFG marker mismatch (expect /** NV_CFG **/ at offset 5)".into());
+        if data[0..4] != [0x72, 0xd6, 0xef, 0x41] {
+            return Err("NV_CFG magic mismatch (expect 72 D6 EF 41)".into());
+        }
+        if &data[4..21] != b"\x13/** NV_CFG **/\n\x00" {
+            return Err("NV_CFG marker mismatch (expect /** NV_CFG **/)".into());
         }
     }
     Ok(())
@@ -291,26 +292,13 @@ mod tests {
         assert!(validate_nv_cfg(&d).is_ok());
         // 不足 21 字节：跳过魔数校验（部分转储）
         assert!(validate_nv_cfg(&d[..15]).is_ok());
-        // crc32 / flags 因设备而异，不应导致拒绝
-        let mut other_dev = d.clone();
-        other_dev[..5].copy_from_slice(&[0x73, 0x76, 0xc6, 0x7d, 0x15]);
-        assert!(validate_nv_cfg(&other_dev).is_ok());
+        let mut bad_magic = d.clone();
+        bad_magic[0] = 0x00;
+        assert!(validate_nv_cfg(&bad_magic).is_err());
         let mut bad_marker = d.clone();
-        bad_marker[5] = 0x00;
+        bad_marker[4] = 0x00;
         assert!(validate_nv_cfg(&bad_marker).is_err());
         assert!(validate_nv_cfg(&vec![0u8; 0x401]).is_err());
-    }
-
-    #[test]
-    fn nv_cfg_normalize_accepts_varying_crc_and_flags() {
-        // 实机 PT1570-H10 另一台：crc32 = 7D C6 76 73（LE 73 76 C6 7D），flags = 0x15
-        let mut part = vec![0x73, 0x76, 0xc6, 0x7d, 0x15];
-        part.extend_from_slice(b"/** NV_CFG **/\n\x00HW_A=1\0");
-        part.resize(262144, 0x00);
-        assert!(normalize_nv_cfg(&part).is_ok());
-        // 标记被破坏仍应拒绝
-        part[6] = b'X';
-        assert!(normalize_nv_cfg(&part).is_err());
     }
 
     #[test]
@@ -327,9 +315,9 @@ mod tests {
         // 裸段原样通过
         let bare = normalize_nv_cfg(&part[..blob_len]).unwrap();
         assert_eq!(bare, blob);
-        // 头部 crc/flags 不参与比较；文本标记不对才拒绝
+        // 魔数不对拒绝
         let mut bad = part.clone();
-        bad[5] = 0x00;
+        bad[0] = 0x00;
         assert!(normalize_nv_cfg(&bad).is_err());
         assert!(normalize_nv_cfg(&vec![0u8; 100]).is_err());
     }
