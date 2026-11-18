@@ -236,52 +236,6 @@ impl App {
         });
     }
 
-    /// NV_CFG 导入 / 清除后立即生效：对**已有**提取结果就地重新组装（或清除）
-    /// Wi-Fi 校准段 0x0100/0x0101，不必重读 250 MB 的 ubi_device。
-    /// 结果追加到状态栏，让用户明确看到「提取到了没有」。
-    fn apply_nvcfg_to_result(&mut self) {
-        if self.wifi_nvcfg.is_some() && self.model != Model::Pt1570 {
-            self.status.push_str(&format!(
-                " ——注意：当前机型是 {}，NV_CFG 只对「友华 PT1570-H10」生效，请先切换机型",
-                self.model.label()
-            ));
-            return;
-        }
-        if self.model != Model::Pt1570 {
-            return;
-        }
-        let Some(Ok(ext)) = self.result.as_mut() else {
-            if self.wifi_nvcfg.is_some() {
-                self.status
-                    .push_str(" ——点「提取」后将据此组装 5G / 2.4G Wi-Fi 校准");
-            }
-            return;
-        };
-        self.build_out = None;
-        match &self.wifi_nvcfg {
-            Some(nv) => match assemble_wifi_from_nvcfg(nv, ext.extracted.identity.base_mac) {
-                Ok((w0, w1)) => {
-                    self.status.push_str(&format!(
-                        " ——已组装 Wi-Fi 校准：5G {} 字节 / 2.4G {} 字节",
-                        w0.len(),
-                        w1.len()
-                    ));
-                    ext.extracted.wifi0 = Some(w0);
-                    ext.extracted.wifi1 = Some(w1);
-                }
-                Err(e) => {
-                    ext.extracted.wifi0 = None;
-                    ext.extracted.wifi1 = None;
-                    self.status.push_str(&format!(" ——Wi-Fi 校准组装失败：{e}"));
-                }
-            },
-            None => {
-                ext.extracted.wifi0 = None;
-                ext.extracted.wifi1 = None;
-            }
-        }
-    }
-
     /// 收取后台提取结果。
     fn poll_job(&mut self, ctx: &egui::Context) {
         if !self.busy {
@@ -599,7 +553,6 @@ impl App {
                     if self.wifi_nvcfg.is_some() && ui.button("清除").clicked() {
                         self.wifi_nvcfg = None;
                         self.status = "已清除 Wi-Fi NV_CFG 转储".into();
-                        self.apply_nvcfg_to_result();
                     }
                     if let Some(d) = &self.wifi_nvcfg {
                         if ui.button("导出…").clicked() {
@@ -641,7 +594,6 @@ impl App {
                                             note
                                         );
                                         self.wifi_nvcfg = Some(blob);
-                                        self.apply_nvcfg_to_result();
                                     }
                                     Err(e) => self.status = format!("导入被拒: {e}"),
                                 },
@@ -895,7 +847,6 @@ impl App {
                                 note
                             );
                             self.wifi_nvcfg = Some(blob);
-                            self.apply_nvcfg_to_result();
                         }
                         Err(e) => self.status = format!("拖拽被拒（NV_CFG 校验失败）: {e}"),
                     },
@@ -955,20 +906,6 @@ fn source_row(
     changed
 }
 
-/// 由 mtd3 NV_CFG 组装 pt1570 的两段 Wi-Fi 校准，返回 `(0x0100 5G, 0x0101 2.4G)`。
-/// 5G=wlan1=base+2、2.4G=wlan0=base+1。头部 crc32/flags 为非 ASCII 字节，
-/// 字段查找只碰 ASCII 的 KEY=VALUE 区，lossy 解码不影响结果。
-fn assemble_wifi_from_nvcfg(
-    nv: &[u8],
-    base_mac: Option<[u8; 6]>,
-) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let text = String::from_utf8_lossy(nv).to_string();
-    let base = base_mac.ok_or("NV_CFG 组装需要 BASE_MAC（请确认 env 已提供 kp_ucaBaseMacAddr）")?;
-    let w0 = calib::flash_calibration_nv(&text, &calib::RADIO1_5G, base)?;
-    let w1 = calib::flash_calibration_nv(&text, &calib::RADIO0_2G, base)?;
-    Ok((w0, w1))
-}
-
 /// 后台线程执行的完整提取流程（与 CLI dump 逻辑一致）。
 /// `nv` 为 pt1570 的 mtd3 NV_CFG 转储（可选）——组装 Wi-Fi 校准（0x0100/0x0101）。
 fn run_extract(
@@ -1009,9 +946,17 @@ fn run_extract(
     // （实机日志 hwaddr 证据），DIFF 字段缺失按产线惯例（实机全 0）补齐。
     if model == Model::Pt1570 {
         if let Some(nv) = &nv {
-            let (w0, w1) = assemble_wifi_from_nvcfg(nv, extracted.identity.base_mac)?;
-            extracted.wifi0 = Some(w0);
-            extracted.wifi1 = Some(w1);
+            // 魔数含非 ASCII 字节（72 D6 EF 41），字段查找只碰 ASCII 的
+            // KEY=VALUE 区，lossy 解码不影响结果
+            let text = String::from_utf8_lossy(nv).to_string();
+            let base = extracted
+                .identity
+                .base_mac
+                .ok_or("NV_CFG 组装需要 BASE_MAC")?;
+            extracted.wifi0 =
+                Some(calib::flash_calibration_nv(&text, &calib::RADIO1_5G, base)?);
+            extracted.wifi1 =
+                Some(calib::flash_calibration_nv(&text, &calib::RADIO0_2G, base)?);
         }
     }
     Ok(Extraction {
